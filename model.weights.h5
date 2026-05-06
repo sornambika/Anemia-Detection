@@ -1,0 +1,320 @@
+!pip install -q keras-cv-attention-models opencv-python-headless seaborn
+
+import os, zipfile, shutil, cv2, numpy as np, matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, roc_auc_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+import seaborn as sns
+from google.colab import files
+
+# Correct import for ConvNeXt
+from keras_cv_attention_models.convnext import ConvNeXtTiny
+
+uploaded = files.upload()
+zip_file = list(uploaded.keys())[0]
+
+extract_path = "/content/dataset_raw"
+with zipfile.ZipFile(zip_file, "r") as zip_ref:
+    zip_ref.extractall(extract_path)
+
+DATA_DIR = os.path.join(extract_path, "4000")
+print("Classes:", os.listdir(DATA_DIR))
+
+
+anemic_dir = os.path.join(DATA_DIR, "Anemic")
+non_dir = os.path.join(DATA_DIR, "Non-anemic")
+
+anemic_files = [os.path.join(anemic_dir, f) for f in os.listdir(anemic_dir)]
+non_files = [os.path.join(non_dir, f) for f in os.listdir(non_dir)]
+
+_, test_a = train_test_split(anemic_files, test_size=0.1, random_state=42)
+_, test_n = train_test_split(non_files, test_size=0.1, random_state=42)
+
+TEST_DIR = "/content/test"
+os.makedirs(TEST_DIR + "/Anemic", exist_ok=True)
+os.makedirs(TEST_DIR + "/Non-anemic", exist_ok=True)
+
+for f in test_a: shutil.copy(f, TEST_DIR + "/Anemic")
+for f in test_n: shutil.copy(f, TEST_DIR + "/Non-anemic")
+
+def clahe_preprocess(img):
+    img = img.astype(np.uint8)
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(2.0, (8,8))
+    l = clahe.apply(l)
+    img = cv2.merge((l,a,b))
+    img = cv2.cvtColor(img, cv2.COLOR_LAB2RGB)
+    img = tf.keras.applications.imagenet_utils.preprocess_input(img)
+    return img
+
+IMG_SIZE = 224
+BATCH_SIZE = 16
+
+train_datagen = ImageDataGenerator(
+    preprocessing_function=clahe_preprocess,
+    validation_split=0.2,
+    rotation_range=40,
+    zoom_range=0.3,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    brightness_range=[0.7,1.3],
+    horizontal_flip=True,
+    vertical_flip=True,
+    shear_range=0.2
+)
+
+train_gen = train_datagen.flow_from_directory(
+    DATA_DIR,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode="binary",
+    subset="training"
+)
+
+val_gen = train_datagen.flow_from_directory(
+    DATA_DIR,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode="binary",
+    subset="validation"
+)
+
+# Compute class weights
+class_weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(train_gen.classes),
+    y=train_gen.classes
+)
+class_weights = dict(enumerate(class_weights))
+print("Class weights:", class_weights)
+
+test_gen = ImageDataGenerator(
+    preprocessing_function=clahe_preprocess
+).flow_from_directory(
+    TEST_DIR,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=1,
+    class_mode="binary",
+    shuffle=False
+)
+
+
+def build_convnext_model():
+    # Use num_classes=0 to remove top classifier
+    base = ConvNeXtTiny(
+        num_classes=0,        # remove top
+        pretrained="imagenet"
+    )
+    base.trainable = True
+
+    inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    x = base(inputs)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(512, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = models.Model(inputs, outputs)
+    return model
+
+model = build_convnext_model()
+model.summary()
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4),
+    loss="binary_crossentropy",
+    metrics=["accuracy", tf.keras.metrics.AUC(name="auc")]
+)
+
+callbacks = [
+    EarlyStopping(
+        monitor="val_auc",
+        mode="max",
+        patience=10,
+        restore_best_weights=True
+    ),
+    ReduceLROnPlateau(
+        monitor="val_auc",
+        mode="max",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6
+    )
+]
+
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=60,
+    class_weight=class_weights,
+    callbacks=callbacks
+)
+
+y_probs = model.predict(test_gen).ravel()
+y_true = test_gen.classes
+
+fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+best_idx = np.argmax(tpr - fpr)
+best_thresh = thresholds[best_idx]
+y_pred = (y_probs >= best_thresh).astype(int)
+
+print("Optimal threshold:", best_thresh)
+print(classification_report(y_true, y_pred, target_names=["Anemic", "Non-anemic"]))
+print("ROC-AUC:", roc_auc_score(y_true, y_probs))
+
+cm = confusion_matrix(y_true, y_pred)
+sns.heatmap(cm, annot=True, fmt="d",
+            xticklabels=["Anemic", "Non-anemic"],
+            yticklabels=["Anemic", "Non-anemic"])
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+from sklearn.metrics import roc_curve, roc_auc_score
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Predict probabilities
+y_probs = model.predict(test_gen).ravel()
+y_true = test_gen.classes
+
+# Compute ROC
+fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+auc_score = roc_auc_score(y_true, y_probs)
+
+# Plot ROC curve
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, linewidth=2, label=f"ROC Curve (AUC = {auc_score:.3f})")
+plt.plot([0,1], [0,1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve – Anemia Detection (ConvNeXt)")
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+
+print("ROC-AUC:", auc_score)
+
+
+model = build_convnext_model()
+model.summary()
+
+
+model.save("/content/anemia_convnext_model.keras")
+
+
+print("Grad-CAM layer:", find_last_conv_layer(model))
+
+
+# =========================
+# GRAD-CAM HELPERS
+# =========================
+
+def find_last_conv_layer(model):
+    for layer in reversed(model.layers):
+        # Skip nested models like convnext_tiny
+        if isinstance(layer, tf.keras.Model):
+            continue
+
+        try:
+            shape = layer.output.shape
+            if shape is not None and len(shape) == 4:
+                return layer.name
+        except:
+            continue
+
+    raise ValueError("No valid 4D conv layer found for Grad-CAM")
+
+
+
+
+def build_gradcam_model(model, last_conv_layer_name):
+    last_conv_layer = model.get_layer(last_conv_layer_name)
+
+    grad_model = tf.keras.models.Model(
+        inputs=model.input,
+        outputs=[last_conv_layer.output, model.output]
+    )
+    return grad_model
+
+
+def gradcam(model, img_tensor):
+    last_conv_name = find_last_conv_layer(model)
+    grad_model = build_gradcam_model(model, last_conv_name)
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_tensor, training=False)
+
+        # 🔴 CRITICAL LINE
+        tape.watch(conv_outputs)
+
+        loss = predictions[:, 0]
+
+    grads = tape.gradient(loss, conv_outputs)
+
+    if grads is None:
+        raise RuntimeError(
+            "Gradients are None. Grad-CAM layer is not connected to output."
+        )
+
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+    cam = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+
+    cam = tf.nn.relu(cam)
+    cam = cam / (tf.reduce_max(cam) + 1e-8)
+
+    return cam.numpy()
+
+
+
+def overlay_gradcam(img_path, cam, img_size=224, alpha=0.4):
+    orig = cv2.imread(img_path)
+    orig = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)
+    orig = cv2.resize(orig, (img_size, img_size))
+
+    cam_resized = cv2.resize(cam, (img_size, img_size))
+    heatmap = np.uint8(255 * cam_resized)
+
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(orig, 1 - alpha, heatmap, alpha, 0)
+
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,3,1); plt.title("Original"); plt.imshow(orig); plt.axis("off")
+    plt.subplot(1,3,2); plt.title("Grad-CAM"); plt.imshow(heatmap); plt.axis("off")
+    plt.subplot(1,3,3); plt.title("Overlay"); plt.imshow(overlay); plt.axis("off")
+    plt.show()
+
+
+def load_image_for_cam(path, img_size):
+    img = tf.keras.preprocessing.image.load_img(
+        path, target_size=(img_size, img_size)
+    )
+    img = tf.keras.preprocessing.image.img_to_array(img)
+    img = clahe_preprocess(img)
+    img = np.expand_dims(img, axis=0)
+    return tf.convert_to_tensor(img)
+
+
+layer_name = find_last_conv_layer(model)
+print("Grad-CAM layer:", layer_name)
+print("Shape:", model.get_layer(layer_name).output.shape)
+
+
+img_path = test_gen.filepaths[0]
+img_tensor = load_image_for_cam(img_path, IMG_SIZE)
+
+cam = gradcam(model, img_tensor)
+overlay_gradcam(img_path, cam)
+
+
+print("Grad-CAM layer:", find_last_conv_layer(model))
